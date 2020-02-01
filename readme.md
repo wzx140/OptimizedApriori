@@ -20,10 +20,12 @@ mvn package
 ```shell
 spark-submit \
     --master <master_url> \
-    --class  per.wzx.experiment4.Main \
-    Experiment4-1.0.jar \
+    --class  per.wzx.ar.Main \
+    OptimizedApriori-1.0.jar \
     <input> <output> <minSupport>
 ```
 - `input`：输入数据路径
+    - 输入数据格式：每一行对应一个事务，事务项之间用空格分隔
 - `output`：输出路径
+    - 输出数据格式：每一行对应一个频繁项集，频繁项集和对应支持度用`tab`分隔
 - `minSupport`：最小支持度

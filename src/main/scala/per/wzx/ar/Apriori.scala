@@ -1,4 +1,4 @@
-package per.wzx.experiment4
+package per.wzx.ar
 
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
@@ -9,56 +9,6 @@ import scala.collection.{immutable, mutable}
 import scala.util.control.Breaks
 
 class Apriori(private val minSupport: Double) extends Serializable {
-
-  /**
-   * 初始化l1频繁项集，合并重复事务项，事务项元素映射为index
-   *
-   * @param sc           SparkContext
-   * @param transactions 原始事务集
-   * @param minCount     最小count
-   * @return l1WithCnt:频繁1项集(indexed)和count; l1:频繁1项集，用作索引映射元素; item2Rank:事务集中的元素映射索引;
-   *         transactionCnt:事务项计数表; indexedTransactions:事务数据库(indexed)
-   */
-  private def init(sc: SparkContext,
-                   transactions: RDD[Array[String]],
-                   minCount: Int
-                  ): (Array[(Int, Int)], Array[String], Map[String, Int], Map[Int, Int],
-    RDD[(Int, immutable.SortedSet[Int])]) = {
-    // 频繁1项集和count
-    val temp = transactions.flatMap(_.map((_, 1)))
-      .reduceByKey(_ + _)
-      .filter { case (_, count) => count >= minCount }
-      // 根据count由大到小排列
-      .sortBy(-_._2)
-      .persist(StorageLevel.MEMORY_AND_DISK)
-
-    // 频繁1项集，用作索引映射元素
-    val l1 = temp.map(_._1).collect()
-    // 事务集中的元素映射索引
-    val item2Rank = l1.zipWithIndex.toMap
-    // 频繁1项集(indexed)和count
-    val l1WithCnt = temp.map { case (item, x) => (item2Rank(item), x) }.collect()
-    temp.unpersist()
-
-    val l1BC = sc.broadcast(l1)
-    val tmp = transactions
-      // 事务压缩，过滤掉不包含频繁1项集的事务项
-      .filter(_.exists(l1BC.value.contains))
-      // 过滤掉不包含频繁1项集的元素
-      .map(_.filter(l1BC.value.contains))
-      // 统计重复事务项
-      .map(x => (x.toSet, 1)).reduceByKey(_ + _)
-    // 事务项计数表
-    val cntMap = tmp.map(_._2).zipWithIndex().map(x => (x._2.toInt, x._1)).collectAsMap().toMap
-    val item2RankBC = sc.broadcast(item2Rank)
-    // 事务数据库(索引)
-    val indexedTransactions = tmp.map(_._1)
-      .map(_.toArray.map(item2RankBC.value))
-      .map(_.to[immutable.SortedSet])
-      .zipWithIndex().map(x => (x._2.toInt, x._1))
-
-    (l1WithCnt, l1, item2Rank, cntMap, indexedTransactions)
-  }
 
   /**
    * 由频繁k-1项集生成k阶候选集，未并行化
@@ -128,7 +78,6 @@ class Apriori(private val minSupport: Double) extends Serializable {
     val newTransactions = transactions.filter(x => usedMap(x._1))
     tmp.unpersist()
 
-
     (candidatesWithCnt, newTransactions, newCntMap)
   }
 
@@ -148,8 +97,39 @@ class Apriori(private val minSupport: Double) extends Serializable {
     println("-----transaction : " + totalCount + "-----")
     val minCount = math.ceil(minSupport * totalCount).toInt
 
-    // 频繁1项集
-    var (l1WithCnt, l1, item2Rank, cntMap, indexedTransactions) = init(sc, transactions, minCount)
+    // 初始化事务集和生成频繁1项集
+    val temp = transactions.flatMap(_.map((_, 1)))
+      .reduceByKey(_ + _)
+      .filter { case (_, count) => count >= minCount }
+      // 根据支持度计数由大到小排列
+      .sortBy(-_._2)
+      .persist(StorageLevel.MEMORY_AND_DISK)
+
+    // 频繁1项集，用作索引映射元素值
+    val l1 = temp.map(_._1).collect()
+    // 事务集中的元素值映射索引
+    val item2Rank = l1.zipWithIndex.toMap
+    // 频繁1项集(indexed)和支持度计数
+    val l1WithCnt = temp.map { case (item, x) => (item2Rank(item), x) }.collect()
+    temp.unpersist()
+
+    val l1BC = sc.broadcast(l1)
+    val tmp = transactions
+      // 事务压缩，过滤掉不包含频繁1项集的事务项
+      .filter(_.exists(l1BC.value.contains))
+      // 过滤掉不包含频繁1项集的元素
+      .map(_.filter(l1BC.value.contains))
+      // 统计重复事务项
+      .map(x => (x.toSet, 1)).reduceByKey(_ + _).persist(StorageLevel.MEMORY_AND_DISK)
+    transactions.unpersist()
+    // 事务计数表
+    var cntMap = tmp.map(_._2).zipWithIndex().map(x => (x._2.toInt, x._1)).collectAsMap().toMap
+    val item2RankBC = sc.broadcast(item2Rank)
+    // 事务数据库(indexed)
+    var indexedTransactions = tmp.map(_._1)
+      .map(_.toArray.map(item2RankBC.value))
+      .map(_.to[immutable.SortedSet])
+      .zipWithIndex().map(x => (x._2.toInt, x._1))
     println("-----L1          : " + l1.length + "-----")
 
     var k: Int = 2
@@ -170,7 +150,7 @@ class Apriori(private val minSupport: Double) extends Serializable {
           loop.break()
         }
 
-        // 事务压缩，计算count
+        // 事务压缩，计算支持度计数
         val (candidatesWithCnt, newTransactions, newCntMap) = calCount(sc, candidates, indexedTransactions, cntMap, k)
         indexedTransactions = newTransactions
         cntMap = newCntMap
@@ -182,8 +162,8 @@ class Apriori(private val minSupport: Double) extends Serializable {
         k += 1
       }
     }
-
-    // 把索引转化为实际值，事务数计算支持度
+    tmp.unpersist()
+    // 把索引转化为元素值，支持度数计算支持度
     freqItemsWithCnt.map { case (indexes, count) =>
       val cases = indexes.toArray.sorted.reverse.map(l1)
       (cases, count.toDouble / totalCount)

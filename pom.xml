@@ -18,7 +18,7 @@
     <scala.tools.version>2.11</scala.tools.version>
     <scala.version>2.11.12</scala.version>
     <spark.version>2.4.4</spark.version>
-    <package.mainClass>per.wzx.experiment4.Main</package.mainClass>
+    <package.mainClass>per.wzx.ar.Main</package.mainClass>
   </properties>
 
   <dependencies>

@@ -1,4 +1,4 @@
-package per.wzx.experiment4
+package per.wzx.ar
 
 import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
