@@ -1,5 +1,5 @@
 ## OptimizedApriori
-在Spark平台上实现Apriori频繁项集挖掘的并行化算法，利用事务压缩优化`Apriori`算法
+在Spark平台上实现Apriori频繁项集挖掘的并行化算法，利用**事务压缩和布尔矩阵**优化`Apriori`算法
 
 ### 测试数据
 http://fimi.ua.ac.be/data

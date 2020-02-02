@@ -4,81 +4,81 @@ import org.apache.spark.SparkContext
 import org.apache.spark.rdd.RDD
 import org.apache.spark.storage.StorageLevel
 
-import scala.collection.immutable.SortedSet
-import scala.collection.{immutable, mutable}
 import scala.util.control.Breaks
 
 class Apriori(private val minSupport: Double) extends Serializable {
 
   /**
-   * 由频繁k-1项集生成k阶候选集，未并行化
+   * 由频繁k-1项集生成k阶候选集
    *
    * @param sc        SparkContext
    * @param freqItems 频繁k项集
-   * @param k         产生候选集的阶数
+   * @param l1Size    频繁1项集大小
    * @param minCount  最小支持度
    * @return 候选项集
    */
   private def genCandidates(sc: SparkContext,
-                            freqItems: Array[immutable.SortedSet[Int]],
-                            k: Int,
+                            freqItems: RDD[Set[Int]],
+                            l1Size: Int,
                             minCount: Int
-                           ): Array[immutable.SortedSet[Int]] = {
-    val candidates = collection.mutable.ListBuffer.empty[immutable.SortedSet[Int]]
-    freqItems.indices.foreach { i =>
-      Range(i + 1, freqItems.length).foreach { j =>
-        if ((freqItems(i) & freqItems(j)).size == k - 2) {
-          candidates.append(freqItems(i) | freqItems(j))
-        }
-      }
+                           ): RDD[Set[Int]] = {
+    val candidates = freqItems.flatMap { item =>
+      // 候选k+1项集由频繁k项集与一个频繁1项集组合
+      Range(0, l1Size).filter(!item.contains(_))
+        .map(item | Set[Int](_))
     }
-
-    candidates.distinct.filter(x => freqItems.exists(_.subsetOf(x))).toArray
+    // 剪枝，频繁项集的子集也是频繁项集
+    val freqItemsBC = sc.broadcast(freqItems.collect())
+    candidates.distinct().filter { item =>
+      val freqItems = freqItemsBC.value
+      freqItems.exists(_.subsetOf(item))
+    }
   }
 
   /**
    * 计算候选键每个元素的count
    *
-   * @param sc           SparkContext
-   * @param candidates   候选集
-   * @param transactions 原始事务数据库(indexed)
-   * @param k            候选集的阶数
+   * @param sc         SparkContext
+   * @param candidates 候选集
+   * @param boolMatrix 布尔矩阵
    * @return candidatesWithCnt:候选集和事务数; newTransactions:压缩后的事务数据库; newCntMap:压缩后的事务计数表
    */
   private def calCount(sc: SparkContext,
-                       candidates: Array[immutable.SortedSet[Int]],
-                       transactions: RDD[(Int, immutable.SortedSet[Int])],
-                       cntMap: Map[Int, Int],
-                       k: Int
-                      ): (Array[(immutable.SortedSet[Int], Int)], RDD[(Int, immutable.SortedSet[Int])], Map[Int, Int])
-  = {
+                       candidates: RDD[Set[Int]],
+                       boolMatrix: Array[Array[Boolean]],
+                       cntMap: Array[Int]
+                      ): (RDD[(Set[Int], Int)], Array[Array[Boolean]], Array[Int]) = {
 
-    val candidatesBC = sc.broadcast(candidates)
+    val boolMatrixBC = sc.broadcast(boolMatrix)
     val cntMapBC = sc.broadcast(cntMap)
-    // 统计候选项的事务数，事务压缩
-    val tmp = transactions.map { case (tranIndex, tranItem) =>
-      val counts = mutable.ListBuffer.empty[Int]
-      val candidates = candidatesBC.value
+    // 统计候选项对应事务的布尔向量
+    val tmp = candidates.map { item =>
+      val boolMatrix = boolMatrixBC.value
+      val boolVector = item.map(x => boolMatrix.map(_ (x)))
+        // 布尔向量间做位与
+        .reduce(_.zip(_).map(x => x._1 & x._2))
+
+      (item, boolVector)
+    }.cache()
+
+    // 支持度计数
+    val candidatesWithCnt = tmp.map { case (item, vector) =>
       val cntMap = cntMapBC.value
-      // 统计候选集的事务数
-      candidates.foreach { canItem =>
-        if (canItem.subsetOf(tranItem)) counts.append(cntMap(tranIndex)) else counts.append(0)
-      }
-      // 该事务是否使用过
-      val isUsed = counts.sum > 0
+      val count = vector.zip(cntMap).map { case (flag, count) =>
+        if (flag) count else 0
+      }.sum
 
-      (counts.toArray, (tranIndex, isUsed))
-    }.persist(StorageLevel.MEMORY_AND_DISK)
-    val countsAll = tmp.map(_._1).collect()
-      .reduce { (l1, l2) => (l1, l2).zipped.map(_ + _) }
-    val candidatesWithCnt = candidates.zip(countsAll)
-    // 过滤未使用的事务项
-    val usedMap = tmp.map(_._2).collectAsMap()
-    val newCntMap = cntMap.filter(x => usedMap(x._1))
-    val newTransactions = transactions.filter(x => usedMap(x._1))
-    tmp.unpersist()
+      (item, count)
+    }
+    // 事务的使用表
+    val usedMap = tmp.map(_._2)
+      // 布尔向量间做位或
+      .reduce(_.zip(_).map(x => x._1 | x._2))
+    // 事务压缩
+    val newBoolMatrix = boolMatrix.zip(usedMap).filter(_._2).map(_._1)
+    val newCntMap = cntMap.zip(usedMap).filter(_._2).map(_._1)
 
-    (candidatesWithCnt, newTransactions, newCntMap)
+    (candidatesWithCnt, newBoolMatrix, newCntMap)
   }
 
   /**
@@ -90,7 +90,7 @@ class Apriori(private val minSupport: Double) extends Serializable {
    */
   def run(sc: SparkContext,
           transactions: RDD[Array[String]]
-         ): Array[(Array[String], Double)] = {
+         ): RDD[(Array[String], Double)] = {
 
     transactions.persist(StorageLevel.MEMORY_AND_DISK)
     val totalCount = transactions.count()
@@ -103,15 +103,14 @@ class Apriori(private val minSupport: Double) extends Serializable {
       .filter { case (_, count) => count >= minCount }
       // 根据支持度计数由大到小排列
       .sortBy(-_._2)
-      .persist(StorageLevel.MEMORY_AND_DISK)
+      .cache()
 
     // 频繁1项集，用作索引映射元素值
     val l1 = temp.map(_._1).collect()
     // 事务集中的元素值映射索引
     val item2Rank = l1.zipWithIndex.toMap
     // 频繁1项集(indexed)和支持度计数
-    val l1WithCnt = temp.map { case (item, x) => (item2Rank(item), x) }.collect()
-    temp.unpersist()
+    val l1WithCnt = temp.map { case (item, x) => (item2Rank(item), x) }
 
     val l1BC = sc.broadcast(l1)
     val tmp = transactions
@@ -120,53 +119,63 @@ class Apriori(private val minSupport: Double) extends Serializable {
       // 过滤掉不包含频繁1项集的元素
       .map(_.filter(l1BC.value.contains))
       // 统计重复事务项
-      .map(x => (x.toSet, 1)).reduceByKey(_ + _).persist(StorageLevel.MEMORY_AND_DISK)
+      .map(x => (x.toSet, 1)).reduceByKey(_ + _)
     transactions.unpersist()
     // 事务计数表
-    var cntMap = tmp.map(_._2).zipWithIndex().map(x => (x._2.toInt, x._1)).collectAsMap().toMap
+    var cntMap = tmp.map(_._2).collect()
     val item2RankBC = sc.broadcast(item2Rank)
-    // 事务数据库(indexed)
-    var indexedTransactions = tmp.map(_._1)
-      .map(_.toArray.map(item2RankBC.value))
-      .map(_.to[immutable.SortedSet])
-      .zipWithIndex().map(x => (x._2.toInt, x._1))
+    // 构造布尔矩阵
+    var boolMatrix = tmp.map(_._1)
+      .map { transaction =>
+        val item2Rank = item2RankBC.value
+        val boolRow = new Array[Boolean](l1.length)
+        transaction.foreach { x =>
+          boolRow(item2Rank(x)) = true
+        }
+
+        boolRow
+      }.collect()
+    tmp.unpersist()
     println("-----L1          : " + l1.length + "-----")
 
     var k: Int = 2
     // 频繁k项集
-    var lkWithCnt = l1WithCnt.map(x => (immutable.SortedSet(x._1), x._2))
+    var lkWithCnt = l1WithCnt.map(x => (Set(x._1), x._2))
+      .persist(StorageLevel.MEMORY_AND_DISK)
     // 频繁项集集合
-    var freqItemsWithCnt = mutable.ListBuffer.empty[(SortedSet[Int], Int)]
-    freqItemsWithCnt ++= l1WithCnt.map(x => (immutable.SortedSet(x._1), x._2))
+    var freqItemsWithCnt = sc.emptyRDD[(Set[Int], Int)]
+    freqItemsWithCnt = freqItemsWithCnt.union(lkWithCnt)
 
     val loop = new Breaks
     loop.breakable {
       while (!lkWithCnt.isEmpty) {
         println()
         // k阶候选集
-        val candidates = genCandidates(sc, lkWithCnt.map(_._1), k, minCount)
-        println("-----C" + k + "          : " + candidates.length + "-----")
+        val candidates = genCandidates(sc, lkWithCnt.map(_._1), l1.length, minCount)
+          .persist(StorageLevel.MEMORY_AND_DISK)
+        println("-----C" + k + "          : " + candidates.count() + "-----")
         if (candidates.isEmpty) {
           loop.break()
         }
 
         // 事务压缩，计算支持度计数
-        val (candidatesWithCnt, newTransactions, newCntMap) = calCount(sc, candidates, indexedTransactions, cntMap, k)
-        indexedTransactions = newTransactions
+        val (candidatesWithCnt, newBoolMatrix, newCntMap) = calCount(sc, candidates, boolMatrix, cntMap)
+        boolMatrix = newBoolMatrix
         cntMap = newCntMap
-        println("-----transaction : " + indexedTransactions.count() + "-----")
+        println("-----transaction : " + boolMatrix.length + "-----")
         // 支持度过滤
         lkWithCnt = candidatesWithCnt.filter { case (_, count) => count >= minCount }
-        freqItemsWithCnt ++= lkWithCnt
-        println("-----L" + k + "          : " + lkWithCnt.length + "-----")
+          .persist(StorageLevel.MEMORY_AND_DISK)
+        freqItemsWithCnt = freqItemsWithCnt.union(lkWithCnt)
+        println("-----L" + k + "          : " + lkWithCnt.count() + "-----")
+        candidates.unpersist()
         k += 1
       }
     }
-    tmp.unpersist()
     // 把索引转化为元素值，支持度数计算支持度
     freqItemsWithCnt.map { case (indexes, count) =>
-      val cases = indexes.toArray.sorted.reverse.map(l1)
+      val cases = indexes.toArray.sorted.reverse.map(l1BC.value)
       (cases, count.toDouble / totalCount)
-    }.toArray
+    }
   }
 }

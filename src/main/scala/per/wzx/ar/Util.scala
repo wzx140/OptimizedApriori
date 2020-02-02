@@ -22,10 +22,10 @@ object Util {
    * @param path 输出路径
    * @param data 保存数据
    */
-  def writeAsText(sc: SparkContext, data: Array[(Array[String], Double)], path: String): Unit = {
-    sc.parallelize(data.map { case (item, sup) =>
+  def writeAsText(sc: SparkContext, data: RDD[(Array[String], Double)], path: String): Unit = {
+    data.map { case (item, sup) =>
       // 支持度保留两位小数
       item.reduce(_ + " " + _) + "\t" + sup.formatted("%.2f")
-    }).repartition(1).saveAsTextFile(path)
+    }.repartition(1).saveAsTextFile(path)
   }
 }
