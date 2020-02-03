@@ -13,30 +13,31 @@ class Apriori(private val minSupport: Double) extends Serializable {
    *
    * @param sc        SparkContext
    * @param freqItems 频繁k项集
-   * @param l1Size    频繁1项集大小
+   * @param k         阶数
    * @param minCount  最小支持度
    * @return 候选项集
    */
   private def genCandidates(sc: SparkContext,
                             freqItems: RDD[Set[Int]],
-                            l1Size: Int,
+                            k: Int,
                             minCount: Int
                            ): RDD[Set[Int]] = {
-    val candidates = freqItems.flatMap { item =>
-      // 候选k+1项集由频繁k项集与一个频繁1项集组合
-      Range(0, l1Size).filter(!item.contains(_))
-        .map(item | Set[Int](_))
+    val kItem = freqItems.collect()
+    val candidates = collection.mutable.ListBuffer.empty[Set[Int]]
+    kItem.indices.foreach { i =>
+      Range(i + 1, kItem.length).foreach { j =>
+        if ((kItem(i) & kItem(j)).size == k - 2) {
+          candidates.append(kItem(i) | kItem(j))
+        }
+      }
     }
+
     // 剪枝，频繁项集的子集也是频繁项集
-    val freqItemsBC = sc.broadcast(freqItems.collect())
-    candidates.distinct().filter { item =>
-      val freqItems = freqItemsBC.value
-      freqItems.exists(_.subsetOf(item))
-    }
+    sc.parallelize(candidates.distinct.filter(x => kItem.exists(_.subsetOf(x))))
   }
 
   /**
-   * 计算候选键每个元素的count
+   * 计算候选键每个元素的支持度计数
    *
    * @param sc         SparkContext
    * @param candidates 候选集
@@ -151,7 +152,7 @@ class Apriori(private val minSupport: Double) extends Serializable {
       while (!lkWithCnt.isEmpty) {
         println()
         // k阶候选集
-        val candidates = genCandidates(sc, lkWithCnt.map(_._1), l1.length, minCount)
+        val candidates = genCandidates(sc, lkWithCnt.map(_._1), k, minCount)
           .persist(StorageLevel.MEMORY_AND_DISK)
         println("-----C" + k + "          : " + candidates.count() + "-----")
         if (candidates.isEmpty) {
